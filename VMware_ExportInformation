@@ -1,0 +1,54 @@
+#Autore:Nicolas Martinelli
+#Script: Estrazione Host,Target,Devices,Paths,Cluster da tutti i vCenter
+
+#Variabili VCenter
+$VcenterTest = "Test vCenter"
+$VcenterClienti = "Production vCenter"
+$VcenterInterni = "Internal vCenter"
+
+$VCenter = @('Test vCenter', 'Internal vCenter', 'Production vCenter')
+
+#Variabili login
+$User = 'domain\user'
+$pswdFile = 'D:\temp\vmware\ControlloStorage\pass.sec'
+$keyFile = "D:\temp\vmware\ControlloStorage\chiave.key"
+$encryptedPswd = Get-Content -Path $pswdFile | ConvertTo-SecureString -Key (Get-Content -Path $keyFile)
+$cred = New-Object System.Management.Automation.PSCredential($user,$encryptedPswd)
+
+#Connessione Vcenter
+connect-VIServer -Server $VCenter -Credential $cred
+
+#Variabili Array
+$o =@()
+$OutObj =@()
+
+#Variabile Esxi
+$esx = Get-VMHost
+
+#Processo tutti i Vcenter
+foreach ($vc in $global:defaultviservers) {
+	#Processo tutte le HBA
+	foreach($hba in (Get-VMHostHba -VMHost $esx -Type "FibreChannel")){
+		#Recupero dati
+		$target = ((Get-View $hba.VMhost).Config.StorageDevice.ScsiTopology.Adapter | where {$_.Adapter -eq $hba.Key}).Target
+		$luns = Get-ScsiLun -Hba $hba |?{$_.LunType -like "disk"}
+		$nrPaths = ($target | %{$_.Lun.Count} | Measure-Object -Sum).Sum
+
+		#Write-Host "$hba.VMHost $hba.Device "Targets:" $target.Count "Devices:" $luns.Count "Paths:" $nrPaths $hba.VMHost.Parent"
+		
+		#Oggetto con proprietà
+		$OutObj = [PSCustomObject]@{
+		Host = $hba.VMHost
+		HBA = $hba.Device
+		Target = $target.count
+		Device = $luns.Count
+		Path = $nrPaths
+		Cluster = $hba.VMHost.Parent
+		}
+	$o += $OutObj
+	}
+	#Export dati
+	$o | export-csv D:\temp\vmware\ControlloStorage\hba.csv -delimiter ";" -NoTypeInformation 
+}
+#Chiusura connessioni
+Disconnect-VIServer -Server * -Confirm:$false -Force
