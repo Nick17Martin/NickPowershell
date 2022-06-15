@@ -1,0 +1,170 @@
+#Importo il modulo per esportare i dati in Excel
+import-module importexcel
+Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Confirm:$false
+############################-VARIABILI-#####################################################################################################
+	#Variabili VCenter
+	$VcenterTest = "Insert vCenter Test Environment"
+	$VcenterClienti = "Insert vCenter Production Environment"
+	$VcenterInterni = "Insert vCenter Internal Environment"
+
+	$VCenter = @('Test vCenter', 'Prod vCenter', 'Internal vCenter')
+
+	#Variabili file
+	$Data =  Get-Date -UFormat "%m/%d/%Y"
+	$DT = $Data -replace ("/","_")
+	$NewName = "D:\tmp\vmware\AuditVMware\Audit_"+$DT+".xlsx"
+	$ArrayOUT = "D:\tmp\vmware\AuditVMware\Audit.xlsx"
+
+	#Variabili login
+	$User = 'domain\user'
+	$pswdFile = 'D:\tmp\vmware\AuditVMware\KEY\pass.sec'
+	$keyFile = "D:\SEC\tmp\AuditVMware\KEY\chiave.key"
+	$encryptedPswd = Get-Content -Path $pswdFile | ConvertTo-SecureString -Key (Get-Content -Path $keyFile)
+	$cred = New-Object System.Management.Automation.PSCredential($user,$encryptedPswd)
+
+#################################################################################################################################
+##################-FUNZIONI-######################################################################################################
+#Funzione per la ricerca eventi
+function Get-VIEventPlus {
+
+	param(
+		[VMware.VimAutomation.ViCore.Impl.V1.Inventory.InventoryItemImpl[]]$Entity,
+		[string[]]$EventType,
+		[DateTime]$Start,
+		[DateTime]$Finish = (Get-Date),
+		[switch]$Recurse,
+		[string[]]$User,
+		[Switch]$System,
+		[string]$ScheduledTask,
+		[switch]$FullMessage = $false,
+		[switch]$UseUTC = $false
+	)
+
+	process {
+		$eventnumber = 100
+		$events = @()
+		$eventMgr = Get-View EventManager
+		$eventFilter = New-Object VMware.Vim.EventFilterSpec
+		$eventFilter.disableFullMessage = ! $FullMessage
+		$eventFilter.entity = New-Object VMware.Vim.EventFilterSpecByEntity
+		$eventFilter.entity.recursion = &{if($Recurse){"all"}else{"self"}}
+		$eventFilter.eventTypeId = $EventType
+
+		if($Start -or $Finish){
+			$eventFilter.time = New-Object VMware.Vim.EventFilterSpecByTime
+			if($Start){
+				$eventFilter.time.beginTime = $Start
+			}
+			if($Finish){
+				$eventFilter.time.endTime = $Finish
+			}
+		}
+		if($User -or $System){
+			$eventFilter.UserName = New-Object VMware.Vim.EventFilterSpecByUsername
+			if($User){
+				$eventFilter.UserName.userList = $User
+			}
+			if($System){
+				$eventFilter.UserName.systemUser = $System
+			}
+			$System
+		}
+		if($ScheduledTask){
+			$si = Get-View ServiceInstance
+			$schTskMgr = Get-View $si.Content.ScheduledTaskManager
+			$eventFilter.ScheduledTask = Get-View $schTskMgr.ScheduledTask |
+			where {$_.Info.Name -match $ScheduledTask} |
+			Select -First 1 |
+			Select -ExpandProperty MoRef
+		}
+		if(!$Entity){
+			$Entity = @(Get-Folder -NoRecursion)
+		}
+		$entity | %{
+			$eventFilter.entity.entity = $_.ExtensionData.MoRef
+			$eventCollector = Get-View ($eventMgr.CreateCollectorForEvents($eventFilter))
+			$eventsBuffer = $eventCollector.ReadNextEvents($eventnumber)
+			while($eventsBuffer){
+				$events += $eventsBuffer
+				$eventsBuffer = $eventCollector.ReadNextEvents($eventnumber)
+			}
+			$eventCollector.DestroyCollector()
+		}
+		if (-not $UseUTC)
+		{
+			$events | % { $_.createdTime = $_.createdTime.ToLocalTime() }
+		}
+
+		$events
+	}
+}
+
+#Funzione per tracciamento VM create e rimosse
+function Get-NewAndRemovedVMs {
+
+$Cluster = "*"
+$Days = "31"
+
+    $resultARVM = Get-VIEventPlus -Start ((get-date).adddays(-$Days)) -EventType @("VmCreatedEvent", "VmBeingClonedEvent", "VmBeingDeployedEvent","VmRemovedEvent")
+    $sortedResultARVM = $resultARVM | Select-Object CreatedTime, @{N='Cluster';E={$_.ComputeResource.Name}}, @{Name="VMName";Expression={$_.vm.name}}, UserName, @{N='Type';E={$_.GetType().Name}}, FullFormattedMessage
+    $sortedResultARVM | where-object {$_.Cluster -Notlike "Servizi_POC"}
+	$sortedResultARVM | Export-excel $ArrayOUT -AutoSize -TableName VM_CreateRimosse -WorksheetName VM_CreateRimosse
+
+}
+
+#Funzione per tracciamento modifiche alle VM
+Function AuditModifyVM{
+	
+param()
+
+$Cluster = "*"
+$Days = "31"
+
+
+    $result = Get-VIEventPlus -Start ((get-date).adddays(-$Days)) -EventType @("VmReconfiguredEvent")
+    $sortedResult = $result | Select-Object CreatedTime, @{N='Cluster';E={$_.ComputeResource.Name}}, @{Name="VMName";Expression={$_.vm.name}}, UserName, @{N='Type';E={$_.GetType().Name}}, FullFormattedMessage
+	$CsvOUTMP = $sortedResult | where-object {$_.VMName -notlike "*vsa*"}
+	$CsvOU = $CsvOUTMP | where-object {$_.Cluster -Notlike "Servizi_POC"}
+	#$CsvOU | select VMName
+	$CsvOU | export-excel $ArrayOUT -AutoSize -TableName VM_Modificate -WorksheetName VM_Modificate
+	
+}
+
+#################################################################################################################################
+
+#Connessione vCenter
+connect-VIServer -Server $VCenter -Credential $cred
+
+
+#Generazione report modifica VM
+AuditModifyVM
+
+#Generazione report creazione e rimozione VM
+Get-NewAndRemovedVMs
+
+#Chiusura connessioni
+Disconnect-VIServer -Server * -Confirm:$false -Force
+
+#Dati Email
+$from = "sender_mail_address" 
+$TO = @("recipients_mail_address")
+$Subject = "Report automatico AUDIT VMWARE"
+$smtpserver="mail-relay_address"
+
+$MessageBody = @"
+Buongiorno,
+
+in allegato il report relativo alle creazioni, rimozioni e modifiche VM sui  vCenter .
+
+Grazie mille!
+
+"@
+
+#Start-Sleep -s 300 
+#Invio mail
+Send-MailMessage -SmtpServer $smtpserver -Subject $subject -To $TO -From $from -Attachments $ArrayOUT -body $MessageBody
+
+get-date
+
+#Rinomina file con data
+Rename-Item $ArrayOUT $NewName
